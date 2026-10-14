@@ -10,6 +10,7 @@
 //   GP,name,util%,temp,vram_used_MB,vram_total_MB,power_W,power_limit_W,fan%,clock_MHz
 //   WX,temp,feels,wmo_code,wind_kmh,humidity%,tmax,tmin   weather
 //   LK,0|1                         PC lock screen state
+// The board prints "PAGE,n" when the page changes and every second, so the PC only collects what is on screen.
 // Buttons: IO35 = next page (hold = auto-rotate), IO0 = brightness.
 
 #include <Arduino.h>
@@ -469,35 +470,31 @@ void weatherIcon(int cx, int cy, int code) {
 void pageClock() {
   header("CLOCK");
   struct tm tv = {};
-  uint32_t frac = 0;
-  bool ok = localTime(&tv, &frac);
+  bool ok = localTime(&tv);
   char b[24] = "--:--";
-  float sec = 0;
   if (ok) {
     snprintf(b, sizeof b, "%02d:%02d", tv.tm_hour, tv.tm_min);
-    sec = tv.tm_sec + frac / 1000.f;
   }
-  text(b, 8, 52, 6, C_TEXT);
+  text(b, 8, 58, 6, C_TEXT);
   if (ok) {
     static const char* D[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
     static const char* M[] = {"JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"};
     snprintf(b, sizeof b, "%s  %d %s", D[tv.tm_wday], tv.tm_mday, M[tv.tm_mon]);
-    text(b, 10, 92, 2, C_MUTED);
+    text(b, 10, 98, 2, C_MUTED);
   }
 
   if (wxRx && wxCode >= 0) {  // weather block, right side
-    weatherIcon(198, 44, wxCode);
+    weatherIcon(198, 50, wxCode);
     snprintf(b, sizeof b, "%dC", wxTemp);
-    text(b, 198, 84, 4, C_TEXT, MC_DATUM);
+    text(b, 198, 90, 4, C_TEXT, MC_DATUM);
     snprintf(b, sizeof b, "%d / %d", wxMax, wxMin);
-    text(b, 198, 106, 2, C_MUTED, MC_DATUM);
+    text(b, 198, 112, 2, C_MUTED, MC_DATUM);
     snprintf(b, sizeof b, "feels %d  %d%%", wxFeels, wxHum);
-    text(b, 10, 108, 2, C_MUTED);
+    text(b, 10, 116, 2, C_MUTED);
   } else {
     text("KYIV", 198, 50, 2, C_MUTED, MC_DATUM);
     text("no weather yet", 198, 70, 1, C_TRACK, MC_DATUM);
   }
-  bar(10, 124, 220, 4, sec / 60.f, C_CLAUDE);
 }
 
 void pagePing() {
@@ -733,6 +730,15 @@ void loop() {
   dRam += (pc.ram - dRam) * 0.25f;
   dGpu += ((pc.gpu < 0 ? 0 : pc.gpu) - dGpu) * 0.25f;
   dDisk += (pc.disk - dDisk) * 0.25f;
+
+  static int sentPage = -1;
+  static uint32_t sentAt = 0;
+  if (page != sentPage || now - sentAt > 1000) {
+    Serial.print("PAGE,");
+    Serial.println(page);
+    sentPage = page;
+    sentAt = now;
+  }
 
   // auto-dimmer: night hours, locked PC or lost link cap the brightness; fades smoothly
   int target = LEVELS[level];

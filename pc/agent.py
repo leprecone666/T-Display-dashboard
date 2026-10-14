@@ -2,15 +2,21 @@
 
 Run:  pythonw agent.py   (or `python agent.py` to see logs)
 Needs: pip install pyserial psutil
+
+The board reports the page it is showing ("PAGE,n"); the expensive collectors
+(process scan, nvidia-smi, ping, media session) only run while their page is open.
+Until the board reports a page (older firmware) everything runs.
 """
 import argparse
+import atexit
 import json
 import os
 import subprocess
 import tempfile
 import threading
 import time
-from datetime import datetime, timezone
+import unicodedata
+from datetime import datetime
 
 import psutil
 import serial
@@ -20,13 +26,17 @@ VID, PID = 0x1A86, 0x55D4  # CH9102
 STATE_FILE = os.path.join(tempfile.gettempdir(), "claude_tdisplay.json")
 USAGE_FILE = os.path.join(tempfile.gettempdir(), "claude_tdisplay_usage.json")
 DONE_TO_IDLE_S = 30
-TARGETS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "targets.json")
+HERE = os.path.dirname(os.path.abspath(__file__))
+TARGETS_FILE = os.path.join(HERE, "targets.json")
+MEDIA_SCRIPT = os.path.join(HERE, "media.ps1")
 DEFAULT_TARGETS = [
     {"name": "Cloudflare", "host": "1.1.1.1"},
     {"name": "Google DNS", "host": "8.8.8.8"},
 ]
 NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-MEDIA_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "media.ps1")
+
+# board pages, same numbering as in src/main.cpp
+P_PC, P_CLAUDE, P_USAGE, P_TOP, P_GPU, P_NET, P_PING, P_CLOCK, P_MUSIC = range(9)
 
 _TRANSLIT = dict(zip(
     "абвгдеёжзийклмнопрстуфхцчшщъыьэюяіїєґ",
@@ -36,7 +46,6 @@ _TRANSLIT = dict(zip(
 
 def ascii_text(s, limit=60):
     """The display fonts have no Cyrillic: transliterate, strip accents, drop the rest."""
-    import unicodedata
     out = []
     for ch in s:
         low = ch.lower()
@@ -50,35 +59,38 @@ def ascii_text(s, limit=60):
     return s.replace(",", " ").replace("|", " ").strip()[:limit]
 
 
-class Media(threading.Thread):
-    """Reads the Windows media session (Spotify, browsers, players) via media.ps1."""
+class Need:
+    """Which page the board shows. Collectors block here instead of polling:
+    wait_for() sleeps until their page opens, sleep_while() until it closes."""
 
     def __init__(self):
-        super().__init__(daemon=True)
-        self.line = "MD,none,,,0,0\n"
+        self._page = None  # unknown until the board reports one -> everything runs
+        self.cond = threading.Condition()
 
-    def run(self):
-        while True:
-            try:
-                p = subprocess.Popen(
-                    ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", MEDIA_SCRIPT],
-                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, creationflags=NOWIN)
-                for raw in p.stdout:
-                    f = raw.decode("utf-8", "replace").rstrip("\r\n").split("\t")
-                    if len(f) < 5:
-                        self.line = "MD,none,,,0,0\n"
-                        continue
-                    status = {"Playing": "playing", "Paused": "paused"}.get(f[0], "none")
-                    title, artist = ascii_text(f[1]), ascii_text(f[2])
-                    if not title:
-                        status = "none"
-                    pos = int(f[3]) if f[3].isdigit() else 0
-                    dur = int(f[4]) if f[4].isdigit() else 0
-                    self.line = f"MD,{status},{title},{artist},{pos},{dur}\n"
-            except Exception:
-                pass
-            self.line = "MD,none,,,0,0\n"
-            time.sleep(3)
+    @property
+    def page(self):
+        return self._page
+
+    @page.setter
+    def page(self, v):
+        with self.cond:
+            if v != self._page:
+                self._page = v
+                self.cond.notify_all()
+
+    def wants(self, *pages):
+        p = self._page
+        return p is None or p in pages
+
+    def wait_for(self, *pages, timeout=None):
+        with self.cond:
+            self.cond.wait_for(lambda: self.wants(*pages), timeout)
+        return self.wants(*pages)
+
+    def sleep_while(self, seconds, *pages):
+        """Sleep up to `seconds`, but wake early when the page is no longer one of `pages`."""
+        with self.cond:
+            self.cond.wait_for(lambda: not self.wants(*pages), seconds)
 
 
 def find_port():
@@ -86,6 +98,39 @@ def find_port():
         if p.vid == VID and p.pid == PID:
             return p.device
     return None
+
+
+class Reader(threading.Thread):
+    """Reads what the board prints; only "PAGE,n" lines matter. Blocks in read()."""
+
+    def __init__(self, need):
+        super().__init__(daemon=True)
+        self.need, self.ser, self.buf = need, None, b""
+        self.ready = threading.Event()
+
+    def connect(self, ser):
+        self.ser, self.buf = ser, b""
+        self.ready.set()
+
+    def disconnect(self):
+        self.ready.clear()
+        self.ser = None
+
+    def run(self):
+        while True:
+            self.ready.wait()
+            ser = self.ser
+            try:
+                chunk = ser.read(256)  # returns after the 1 s port timeout at the latest
+            except Exception:
+                self.ready.clear()
+                continue
+            *lines, self.buf = (self.buf + chunk).split(b"\n")
+            self.buf = self.buf[-64:]
+            for ln in lines:
+                ln = ln.strip()
+                if ln.startswith(b"PAGE,") and ln[5:].isdigit():
+                    self.need.page = int(ln[5:])
 
 
 class Gpu:
@@ -105,11 +150,11 @@ class Gpu:
         except ValueError:
             return -1.0  # "[N/A]", "[Not Supported]"
 
-    def read(self):
+    def read(self, min_interval=2.0):
         """-> (util, temp); the full record is in self.vals."""
         if not self.ok:
             return -1.0, -1.0
-        if time.time() - self.t >= 2:
+        if time.time() - self.t >= min_interval:
             self.t = time.time()
             try:
                 out = subprocess.run(
@@ -133,10 +178,11 @@ class Gpu:
 
 
 class Pinger(threading.Thread):
-    """Pings the hosts from targets.json every few seconds (read-only ICMP echo)."""
+    """Pings the hosts from targets.json (read-only ICMP echo) while the Ping page is open."""
 
-    def __init__(self):
+    def __init__(self, need):
         super().__init__(daemon=True)
+        self.need = need
         self.line = ""
 
     @staticmethod
@@ -162,46 +208,122 @@ class Pinger(threading.Thread):
 
     def run(self):
         while True:
+            if not self.need.wants(P_PING):
+                self.line = ""
+                self.need.wait_for(P_PING)
             parts = []
             for t in self.load():
                 name = str(t.get("name", t["host"])).replace(",", " ")[:11]
                 parts.append(f"{name},{self.ping(t['host'])}")
             self.line = "PG," + ",".join(parts) + "\n"
-            time.sleep(3)
+            self.need.sleep_while(4, P_PING)
 
 
 class Procs(threading.Thread):
-    """Top processes by CPU (then RAM), aggregated by executable name."""
+    """Top processes by CPU (then RAM), aggregated by executable name, only on the Top page."""
 
     SKIP = {"System Idle Process", "System", "Registry", "Memory Compression"}
 
-    def __init__(self):
+    def __init__(self, need):
         super().__init__(daemon=True)
+        self.need = need
         self.line = ""
+        self.ncpu = psutil.cpu_count() or 1
+
+    def scan(self):
+        agg = {}
+        for p in psutil.process_iter(["name", "memory_info"]):
+            try:
+                name = p.info["name"] or "?"
+                if name in self.SKIP:
+                    continue
+                cpu = p.cpu_percent(None) / self.ncpu
+                mb = p.info["memory_info"].rss // 2**20
+                a = agg.setdefault(name, [0.0, 0])
+                a[0] += cpu
+                a[1] += mb
+            except Exception:
+                pass
+        top = sorted(agg.items(), key=lambda kv: (round(kv[1][0]), kv[1][1]), reverse=True)[:4]
+        parts = []
+        for name, (cpu, mb) in top:
+            short = name[:-4] if name.lower().endswith(".exe") else name
+            parts.append(f"{short.replace(',', ' ')[:10]},{cpu:.0f},{mb}")
+        return "TP," + ",".join(parts) + "\n"
 
     def run(self):
-        ncpu = psutil.cpu_count() or 1
+        primed = False
         while True:
-            agg = {}
-            for p in psutil.process_iter(["name", "memory_info"]):
-                try:
-                    name = p.info["name"] or "?"
-                    if name in self.SKIP:
-                        continue
-                    cpu = p.cpu_percent(None) / ncpu
-                    mb = p.info["memory_info"].rss // 2**20
-                    a = agg.setdefault(name, [0.0, 0])
-                    a[0] += cpu
-                    a[1] += mb
-                except Exception:
-                    pass
-            top = sorted(agg.items(), key=lambda kv: (round(kv[1][0]), kv[1][1]), reverse=True)[:4]
-            parts = []
-            for name, (cpu, mb) in top:
-                short = name[:-4] if name.lower().endswith(".exe") else name
-                parts.append(f"{short.replace(',', ' ')[:10]},{cpu:.0f},{mb}")
-            self.line = "TP," + ",".join(parts) + "\n"
-            time.sleep(2)
+            if not self.need.wants(P_TOP):
+                self.line, primed = "", False
+                self.need.wait_for(P_TOP)
+            if not primed:  # cpu_percent needs a previous sample: prime, wait, then publish
+                self.scan()
+                time.sleep(1.0)
+                primed = True
+            self.line = self.scan()
+            self.need.sleep_while(3, P_TOP)
+
+
+class Media(threading.Thread):
+    """Windows media session (Spotify, browsers, players). The PowerShell reader (~100 MB)
+    runs only while the Music page is open and stops 8 s after leaving it."""
+
+    EMPTY = "MD,none,,,0,0\n"
+
+    def __init__(self, need):
+        super().__init__(daemon=True)
+        self.need = need
+        self.line = ""
+        self.proc = None
+        atexit.register(self.stop)
+
+    def stop(self):
+        p, self.proc = self.proc, None
+        if p and p.poll() is None:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+
+    def pump(self, p):
+        try:
+            for raw in p.stdout:
+                f = raw.decode("utf-8", "replace").rstrip("\r\n").split("\t")
+                if len(f) < 5:
+                    self.line = self.EMPTY
+                    continue
+                status = {"Playing": "playing", "Paused": "paused"}.get(f[0], "none")
+                title, artist = ascii_text(f[1]), ascii_text(f[2])
+                if not title:
+                    status = "none"
+                pos = int(f[3]) if f[3].isdigit() else 0
+                dur = int(f[4]) if f[4].isdigit() else 0
+                self.line = f"MD,{status},{title},{artist},{pos},{dur}\n"
+        except Exception:
+            pass
+
+    def ensure(self):
+        if self.proc is None or self.proc.poll() is not None:
+            try:
+                self.line = self.EMPTY
+                self.proc = subprocess.Popen(
+                    ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", MEDIA_SCRIPT,
+                     "-ParentPid", str(os.getpid())],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, creationflags=NOWIN)
+                threading.Thread(target=self.pump, args=(self.proc,), daemon=True).start()
+            except Exception:
+                time.sleep(3)
+
+    def run(self):
+        while True:
+            self.need.wait_for(P_MUSIC)
+            while self.need.wants(P_MUSIC):
+                self.ensure()
+                self.need.sleep_while(5, P_MUSIC)  # also notices a crashed reader
+            if not self.need.wait_for(P_MUSIC, timeout=8):  # keep it 8 s in case the user comes back
+                self.stop()
+                self.line = ""
 
 
 def _minutes_until(v):
@@ -224,6 +346,7 @@ def usage_line():
             d = json.load(f)
     except Exception:
         return ""
+
     def pct(k):
         v = d.get(k)
         return -1 if v is None else int(round(float(v)))
@@ -296,28 +419,48 @@ def open_port(name):
     s.baudrate = 115200
     s.dtr = False  # DTR/RTS must stay low, otherwise the board resets
     s.rts = False
-    s.timeout = 0
+    s.timeout = 1.0  # the reader thread blocks in read(); writes are not affected
     s.open()
     return s
 
 
+def go_low_priority():
+    """Idle priority + Windows "efficiency mode" (EcoQoS): the agent never competes with real work."""
+    try:
+        psutil.Process().nice(psutil.IDLE_PRIORITY_CLASS)
+    except Exception:
+        pass
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class PowerThrottling(ctypes.Structure):
+            _fields_ = [("Version", wintypes.ULONG), ("ControlMask", wintypes.ULONG), ("StateMask", wintypes.ULONG)]
+
+        state = PowerThrottling(1, 1, 1)  # version 1, control + enable PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+        k32 = ctypes.windll.kernel32
+        k32.SetProcessInformation(k32.GetCurrentProcess(), 4, ctypes.byref(state), ctypes.sizeof(state))  # 4 = ProcessPowerThrottling
+    except Exception:
+        pass
+
+
 def main():
+    go_low_priority()
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", help="COM port (auto-detected by default)")
     args = ap.parse_args()
 
+    need = Need()
+    reader = Reader(need)
     gpu = Gpu()
-    pinger = Pinger()
-    pinger.start()
-    procs = Procs()
-    procs.start()
-    media = Media()
-    media.start()
-    weather = Weather()
-    weather.start()
+    pinger, procs, media, weather = Pinger(need), Procs(need), Media(need), Weather()
+    for t in (reader, pinger, procs, media, weather):
+        t.start()
     psutil.cpu_percent(None)
     last_net = psutil.net_io_counters()
     last_t = time.time()
+    boot = psutil.boot_time()
+    disk, disk_at, tm_at = 0, 0.0, 0.0
     ser = None
 
     while True:
@@ -325,9 +468,12 @@ def main():
             if ser is None:
                 port = args.port or find_port()
                 if not port:
-                    time.sleep(2)
+                    time.sleep(5)
                     continue
                 ser = open_port(port)
+                reader.connect(ser)
+                tm_at = 0.0
+                need.page = None  # unknown again until the board reports
                 print("connected to", port)
                 time.sleep(0.5)
 
@@ -341,29 +487,37 @@ def main():
 
             cpu = psutil.cpu_percent(None)
             ram = psutil.virtual_memory().percent
-            disk = psutil.disk_usage(os.environ.get("SystemDrive", "C:") + "\\").percent
-            uptime = int(now - psutil.boot_time())
+            if now - disk_at > 15:  # disk usage barely moves
+                disk = psutil.disk_usage(os.environ.get("SystemDrive", "C:") + "\\").percent
+                disk_at = now
+            uptime = int(now - boot)
 
-            g_util, g_temp = gpu.read()
+            g_util, g_temp = -1.0, -1.0
+            if need.wants(P_PC, P_GPU):
+                g_util, g_temp = gpu.read(2.0 if need.wants(P_GPU) else 4.0)
             ser.write(f"PC,{cpu:.0f},{ram:.0f},{g_util:.0f},{disk:.0f},{down:.1f},{up:.1f},{uptime},{g_temp:.0f}\n".encode())
             ser.write(claude_line().encode())
-            ser.write(f"TM,{int(now) + time.localtime(now).tm_gmtoff}\n".encode())
-            if pinger.line:
-                ser.write(pinger.line.encode())
-            if procs.line:
-                ser.write(procs.line.encode())
-            ser.write(media.line.encode())
-            if gpu.line():
-                ser.write(gpu.line().encode())
+            if now - tm_at > 30:  # the board keeps time on its own between updates
+                ser.write(f"TM,{int(now) + time.localtime(now).tm_gmtoff}\n".encode())
+                tm_at = now
+            ser.write(f"LK,{int(is_locked())}\n".encode())
             if weather.line:
                 ser.write(weather.line.encode())
-            ser.write(f"LK,{int(is_locked())}\n".encode())
-            ul = usage_line()
-            if ul:
-                ser.write(ul.encode())
-            ser.read(1024)  # drain anything the board prints
+            if need.wants(P_USAGE, P_CLAUDE):
+                ul = usage_line()
+                if ul:
+                    ser.write(ul.encode())
+            if need.wants(P_GPU) and gpu.line():
+                ser.write(gpu.line().encode())
+            if need.wants(P_TOP) and procs.line:
+                ser.write(procs.line.encode())
+            if need.wants(P_PING) and pinger.line:
+                ser.write(pinger.line.encode())
+            if need.wants(P_MUSIC) and media.line:
+                ser.write(media.line.encode())
         except (serial.SerialException, OSError) as e:
             print("serial error:", e)
+            reader.disconnect()
             try:
                 if ser:
                     ser.close()
